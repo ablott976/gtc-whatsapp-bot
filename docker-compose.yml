@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN}
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./gtc_bot.db}
+    volumes:
+      - bot_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  bot_data:
