@@ -1,126 +1,107 @@
-import aiosqlite
-import json
+"""Database layer - PostgreSQL via asyncpg."""
+import logging
 from typing import Optional
+
+import asyncpg
+
 from app.config import settings
 
-DB_PATH = settings.database_url.replace("sqlite+aiosqlite:///", "")
+logger = logging.getLogger(__name__)
+
+_pool: Optional[asyncpg.Pool] = None
 
 
-async def get_db():
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    return db
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(settings.database_url, min_size=2, max_size=10)
+    return _pool
 
 
 async def init_db():
-    db = await get_db()
-    await db.executescript("""
-        CREATE TABLE IF NOT EXISTS routes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL UNIQUE,
-            gtc_url TEXT NOT NULL,
-            company TEXT NOT NULL,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL,
-            active INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_routes_phone ON routes(phone);
-        CREATE INDEX IF NOT EXISTS idx_conversations_phone ON conversations(phone, created_at);
-    """)
-    await db.commit()
-    await db.close()
+    """Run init.sql on startup."""
+    pool = await get_pool()
+    with open("sql/init.sql", "r") as f:
+        await pool.execute(f.read())
+    logger.info("Database initialized (PostgreSQL)")
 
 
-# ── Routes CRUD ──────────────────────────────────────
+# ── Query helpers ──────────────────────────────────────
+
+async def fetchrow(query, *args):
+    pool = await get_pool()
+    row = await pool.fetchrow(query, *args)
+    return dict(row) if row else None
+
+
+async def fetch(query, *args):
+    pool = await get_pool()
+    return [dict(r) for r in await pool.fetch(query, *args)]
+
+
+async def fetchval(query, *args):
+    pool = await get_pool()
+    return await pool.fetchval(query, *args)
+
+
+async def execute(query, *args):
+    pool = await get_pool()
+    return await pool.execute(query, *args)
+
+
+# ── Routes CRUD ─────────────────────────────────────────
 
 async def list_routes() -> list[dict]:
-    db = await get_db()
-    cursor = await db.execute_fetchall("SELECT * FROM routes ORDER BY phone")
-    await db.close()
-    return [dict(r) for r in cursor]
+    return await fetch("SELECT * FROM routes ORDER BY created_at DESC")
 
 
 async def get_route_by_phone(phone: str) -> Optional[dict]:
-    db = await get_db()
-    cursor = await db.execute_fetchall(
-        "SELECT * FROM routes WHERE phone = ? AND active = 1", (phone,)
-    )
-    await db.close()
-    rows = [dict(r) for r in cursor]
-    return rows[0] if rows else None
+    return await fetchrow("SELECT * FROM routes WHERE phone = $1 AND active = true", phone)
 
 
-async def create_route(phone: str, gtc_url: str, company: str, username: str, password: str) -> dict:
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO routes (phone, gtc_url, company, username, password) VALUES (?, ?, ?, ?, ?)",
-        (phone, gtc_url, company, username, password),
+async def create_route(phone: str, gtc_url: str, company: str, username: str, password: str,
+                       company_name: str = "", gtc_utc: int = 2, language: str = "es") -> dict:
+    return await fetchrow(
+        """INSERT INTO routes (phone, company_name, gtc_url, company, username, password, gtc_utc, language)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *""",
+        phone, company_name, gtc_url, company, username, password, gtc_utc, language,
     )
-    await db.commit()
-    row = await db.execute_fetchall("SELECT * FROM routes WHERE phone = ?", (phone,))
-    await db.close()
-    return dict(row[0])
 
 
 async def update_route(route_id: int, **kwargs) -> Optional[dict]:
-    db = await get_db()
-    sets = ", ".join(f"{k} = ?" for k in kwargs if k in ("phone", "gtc_url", "company", "username", "password", "active"))
-    vals = [kwargs[k] for k in kwargs if k in ("phone", "gtc_url", "company", "username", "password", "active")]
-    if not sets:
-        await db.close()
+    allowed = {"phone", "company_name", "gtc_url", "company", "username", "password", "gtc_utc", "language", "active"}
+    filtered = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+    if not filtered:
         return None
-    vals.append(route_id)
-    await db.execute(f"UPDATE routes SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", vals)
-    await db.commit()
-    row = await db.execute_fetchall("SELECT * FROM routes WHERE id = ?", (route_id,))
-    await db.close()
-    return dict(row[0]) if row else None
+    sets = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(filtered.keys()))
+    values = list(filtered.values())
+    return await fetchrow(f"UPDATE routes SET {sets}, updated_at = NOW() WHERE id = $1 RETURNING *", route_id, *values)
 
 
 async def delete_route(route_id: int) -> bool:
-    db = await get_db()
-    await db.execute("DELETE FROM routes WHERE id = ?", (route_id,))
-    affected = db.total_changes
-    await db.commit()
-    await db.close()
-    return affected > 0
+    result = await execute("DELETE FROM routes WHERE id = $1", route_id)
+    return "DELETE" in str(result)
 
 
-# ── Conversations ────────────────────────────────────
+# ── Conversations ───────────────────────────────────────
 
-async def save_message(phone: str, role: str, content: str):
-    db = await get_db()
-    await db.execute(
-        "INSERT INTO conversations (phone, role, content) VALUES (?, ?, ?)",
-        (phone, role, content),
+async def save_message(phone: str, direction: str, content: str,
+                       intent: str = None, route_id: int = None):
+    await execute(
+        """INSERT INTO conversations (route_id, phone, direction, message, intent)
+           VALUES ($1, $2, $3, $4, $5)""",
+        route_id, phone, direction, content[:4000], intent,
     )
-    await db.commit()
-    await db.close()
 
 
 async def get_conversation(phone: str, limit: int = 20) -> list[dict]:
-    db = await get_db()
-    cursor = await db.execute_fetchall(
-        "SELECT role, content FROM conversations WHERE phone = ? ORDER BY created_at DESC LIMIT ?",
-        (phone, limit),
+    """Get conversation as [{role: 'user'|'model', content: '...'}] for Gemini."""
+    rows = await fetch(
+        "SELECT direction, message FROM conversations WHERE phone = $1 ORDER BY created_at DESC LIMIT $2",
+        phone, limit,
     )
-    await db.close()
-    return [dict(r) for r in reversed(cursor)]
-
-
-async def clear_conversation(phone: str):
-    db = await get_db()
-    await db.execute("DELETE FROM conversations WHERE phone = ?", (phone,))
-    await db.commit()
-    await db.close()
+    result = []
+    for r in reversed(rows):
+        role = "user" if r["direction"] == "inbound" else "model"
+        result.append({"role": role, "content": r["message"]})
+    return result

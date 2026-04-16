@@ -7,13 +7,45 @@ services:
       - WHATSAPP_VERIFY_TOKEN=${WHATSAPP_VERIFY_TOKEN}
       - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
       - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3-flash-preview}
+      - ADMIN_USER=${ADMIN_USER:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
-      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./gtc_bot.db}
-    volumes:
-      - bot_data:/app/data
+      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET:-change-this-secret}
+      - DATABASE_URL=postgresql://gtc:gtc@db:5432/gtc_bot
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
     restart: unless-stopped
 
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gtc
+      POSTGRES_PASSWORD: gtc
+      POSTGRES_DB: gtc_bot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gtc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
-  bot_data:
+  pgdata:
+  redisdata:

@@ -6,4 +6,7 @@ __pycache__/
 .venv/
 node_modules/
 dist/
+admin/dist/
+admin/node_modules/
 *.log
+*.egg-info/

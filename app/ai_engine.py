@@ -1,10 +1,10 @@
 """
-Gemini AI Engine - Natural language to GTC API calls
+Gemini AI Engine - Natural language to GTC API calls.
 Uses function calling to map WhatsApp messages to GoTimeCloud operations.
 """
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from google import genai
 from google.genai import types
 from app.config import settings
@@ -22,21 +22,24 @@ REGLAS:
 - Para buscar empleados, usa parte del nombre
 - Los codigos de empleado son 9 digitos numericos
 - Las fechas van en formato YYYYMMDD (ej: 20260501 = 1 de mayo 2026)
-- Los eventos: 0000=Trabajo, 0004=Vacaciones, 0003=Baja, 0005=Permiso
+- Los eventos: 0000=Trabajo, 0004=Vacaciones, 0003=Baja, 0005=Permiso, 0001=Ausencia justificada, 0002=Baja medica
 - Si no encuentras un empleado, pregunta por el nombre completo
 - Si algo falla, explica que paso de forma simple
 - Para resumenes usa el formato: nombre del campo seguido de su valor, una por linea
 
 CAPACIDADES:
 - Listar y buscar empleados
+- Crear, actualizar y eliminar empleados
 - Ver fichajes de hoy o de una fecha concreta
 - Registrar fichajes manuales
 - Ver resumen del dia (llegadas tarde, fichajes faltantes, dispositivos caidos)
+- Ver fichajes faltantes (sin cierre)
 - Gestionar vacaciones y ausencias
 - Consultar horarios, perfiles, calendarios
 - Ver estado de dispositivos
 - Consultar centros y departamentos
 - Ver acumulados de un empleado
+- Ver informacion de la suscripcion
 """
 
 
@@ -148,6 +151,16 @@ def _get_tools_schema() -> list:
             }
         },
         {
+            "name": "check_missing_punches",
+            "description": "Busca empleados con fichajes sin cierre (numero impar de fichajes).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "Fecha YYYYMMDD (opcional, default hoy)"}
+                }
+            }
+        },
+        {
             "name": "request_vacation",
             "description": "Solicita vacaciones para un empleado en un rango de fechas.",
             "parameters": {
@@ -157,6 +170,19 @@ def _get_tools_schema() -> list:
                     "code": {"type": "string", "description": "Codigo del empleado"},
                     "date_from": {"type": "string", "description": "Fecha inicio YYYYMMDD"},
                     "date_to": {"type": "string", "description": "Fecha fin YYYYMMDD"}
+                }
+            }
+        },
+        {
+            "name": "set_absence",
+            "description": "Registra una ausencia o baja para un empleado.",
+            "parameters": {
+                "type": "object",
+                "required": ["code", "date", "event_code"],
+                "properties": {
+                    "code": {"type": "string", "description": "Codigo del empleado"},
+                    "date": {"type": "string", "description": "Fecha YYYYMMDD"},
+                    "event_code": {"type": "string", "description": "Codigo evento: 0001=Ausencia justificada, 0002=Baja medica, 0003=Baja, 0005=Permiso"}
                 }
             }
         },
@@ -207,7 +233,7 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
             emps = await gtc.list_employees()
             if not emps:
                 return "No hay empleados."
-            lines = [f"{e['code']} | {e['name']} {e.get('surnames','')} | Dept: {e.get('department','')} | Activo: {'Si' if e.get('active') else 'No'}" for e in emps[:30]]
+            lines = [f"{e['code']} | {e['name']} {e.get('surnames', '')} | Dept: {e.get('department', '')} | Activo: {'Si' if e.get('active') else 'No'}" for e in emps[:30]]
             return f"{len(emps)} empleados:\n" + "\n".join(lines)
 
         elif tool_name == "find_employee":
@@ -219,7 +245,8 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
         elif tool_name == "create_employee":
             existing = await gtc.list_employees()
             next_code = str(max(int(e["code"]) for e in existing) + 1).zfill(9) if existing else "000000001"
-            r = await gtc.create_employee(next_code, args["name"], args["surnames"], **{k: v for k, v in args.items() if k not in ("name", "surnames")})
+            r = await gtc.create_employee(next_code, args["name"], args["surnames"],
+                                          **{k: v for k, v in args.items() if k not in ("name", "surnames")})
             if r["status"]["code"] == 200:
                 return f"Empleado creado: {args['name']} {args['surnames']} con codigo {next_code}"
             return f"Error al crear: {r['status']['message']}"
@@ -240,17 +267,17 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
             punches = await gtc.get_today_punches(args["code"])
             if not punches:
                 return "Sin fichajes hoy."
-            return "Fichajes de hoy:\n" + "\n".join(f"  {p.get('time','?')} ({p.get('event','0000')})" for p in punches)
+            return "Fichajes de hoy:\n" + "\n".join(f"  {p.get('time', '?')} ({p.get('event', '0000')})" for p in punches)
 
         elif tool_name == "get_punches_date":
             punches = await gtc.get_employee_punches(args["code"], args["date"], args["date"])
             if not punches:
                 return f"Sin fichajes el {args['date']}."
-            return f"Fichajes del {args['date']}:\n" + "\n".join(f"  {p.get('time','?')} ({p.get('event','0000')})" for p in punches)
+            return f"Fichajes del {args['date']}:\n" + "\n".join(f"  {p.get('time', '?')} ({p.get('event', '0000')})" for p in punches)
 
         elif tool_name == "register_punch":
             date = args.get("date") or datetime.now().strftime("%Y%m%d")
-            time = args.get("time") or (datetime.utcnow() + __import__("datetime").timedelta(hours=2)).strftime("%H%M%S")
+            time = args.get("time") or (datetime.utcnow() + timedelta(hours=gtc.utc)).strftime("%H%M%S")
             r = await gtc.register_punch(args["code"], date, time)
             if r["status"]["code"] == 200:
                 return f"Fichaje registrado: {date} a las {time} para empleado {args['code']}"
@@ -258,29 +285,43 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
 
         elif tool_name == "daily_summary":
             s = await gtc.daily_summary(args.get("date"))
-            lines = [f"Resumen del {s['date']}", f"Empleados: {s['total_employees']}"]
+            lines = [f"Resumen del {s['date']}",
+                     f"Empleados: {s['total_employees']} (con fichajes: {s.get('employees_with_punches', '?')})"]
             if s["missing_exit_punch"]:
                 lines.append(f"Fichajes sin salida ({len(s['missing_exit_punch'])}):")
                 for m in s["missing_exit_punch"][:5]:
                     lines.append(f"  {m['name']}: {m['punches']} fichajes, ultimo {m['last_punch']}")
-            if s["late_arrivals"]:
+            if s.get("late_arrivals"):
                 lines.append(f"Llegadas tarde ({len(s['late_arrivals'])}):")
                 for l in s["late_arrivals"]:
                     lines.append(f"  {l['name']}: +{l['delay_min']}min")
-            if s["early_departures"]:
+            if s.get("early_departures"):
                 lines.append(f"Salidas anticipadas ({len(s['early_departures'])}):")
                 for e in s["early_departures"]:
                     lines.append(f"  {e['name']}: -{e['left_early_min']}min")
             if s["offline_devices"]:
                 lines.append(f"Dispositivos offline: {len(s['offline_devices'])}")
-            if not s["missing_exit_punch"] and not s["late_arrivals"] and not s["early_departures"]:
+            if not s["missing_exit_punch"] and not s.get("late_arrivals") and not s.get("early_departures"):
                 lines.append("Sin anomalias.")
             return "\n".join(lines)
+
+        elif tool_name == "check_missing_punches":
+            missing = await gtc.check_missing_punches(args.get("date"))
+            if not missing:
+                return "Todos los fichajes estan cerrados."
+            return f"Empleados con fichajes sin cierre ({len(missing)}):\n" + "\n".join(
+                f"  {m['name']}: {m['punches']} fichajes, ultimo {m['last_punch']}" for m in missing[:10])
 
         elif tool_name == "request_vacation":
             r = await gtc.create_petition(args["code"], "0004", args["date_from"], args["date_to"])
             if r["status"]["code"] == 200:
                 return f"Vacaciones solicitadas para {args['code']} del {args['date_from']} al {args['date_to']}"
+            return f"Error: {r['status']['message']}"
+
+        elif tool_name == "set_absence":
+            r = await gtc.set_employee_status(args["code"], args["date"], args["event_code"])
+            if r["status"]["code"] == 200:
+                return f"Ausencia registrada para empleado {args['code']} el {args['date']}"
             return f"Error: {r['status']['message']}"
 
         elif tool_name == "list_workdays":
@@ -292,9 +333,8 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
             status = await gtc.get_device_status()
             status_map = {d["code"]: d.get("isConnected", "?") for d in status}
             return "Dispositivos:\n" + "\n".join(
-                f"  {d['code']} | {d.get('description','?')} | Online: {'Si' if status_map.get(d['code']) else 'No'}"
-                for d in devs
-            )
+                f"  {d['code']} | {d.get('description', '?')} | Online: {'Si' if status_map.get(d['code']) else 'No'}"
+                for d in devs)
 
         elif tool_name == "list_centers":
             centers = await gtc.list_centers()
@@ -309,9 +349,8 @@ async def execute_tool(gtc: GTCClient, tool_name: str, args: dict) -> str:
             if not accruals:
                 return "Sin acumulados."
             return "Acumulados:\n" + "\n".join(
-                f"  {a.get('description','?')}: {a.get('totalTime',0)} min ({a.get('totalOcurrences',0)} veces)"
-                for a in accruals
-            )
+                f"  {a.get('description', '?')}: {a.get('totalTime', 0)} min ({a.get('totalOcurrences', 0)} veces)"
+                for a in accruals)
 
         elif tool_name == "get_subscription":
             sub = await gtc.get_subscription()
@@ -331,7 +370,7 @@ async def process_message(gtc: GTCClient, message: str, history: list[dict]) -> 
 
     # Build conversation
     contents = []
-    for msg in history[-10:]:  # Last 10 messages for context
+    for msg in history[-10:]:
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
 
